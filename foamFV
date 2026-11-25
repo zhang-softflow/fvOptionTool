@@ -1,0 +1,1422 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 foamFV contributors
+#
+# foamFV is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. See the LICENSE file for details.
+"""
+foamFV - Browse, search and generate OpenFOAM fvOptions entries.
+
+The database is built by parsing the doxygen header comments
+(Description / Usage / \\verbatim / \\table sections) of every class that is
+registered as a finite-volume option (fv::option), plus the fvOptions files
+found in the tutorials.
+
+Sub-commands:
+    build     Scan the sources and write the database
+    list      List fvOptions (optionally by group)
+    search    Full-text search in names and descriptions
+    show      Show description, example, parameters and references
+    example   Print real usage blocks taken from the tutorials
+    add       Write a ready-to-edit entry into <case>/constant/fvOptions
+    html      Generate the stand-alone catalog.html
+
+Database lookup order:
+    1. $FOAMFV_DB
+    2. ${XDG_DATA_HOME:-~/.local/share}/foamFV/fvDatabase-<version>.json,
+       where <version> is the basename of $WM_PROJECT_DIR (written by 'build')
+    3. fvDatabase.json bundled next to this script
+"""
+
+import argparse
+import gzip
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import date
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+TOOL_DIR = Path(__file__).resolve().parent
+BUNDLED_DB = TOOL_DIR / "fvDatabase.json"
+HTML_FILE = TOOL_DIR / "catalog.html"
+HTML_TEMPLATE = TOOL_DIR / "catalog_template.html"
+
+# Directories that only contain build artefacts or copies of headers
+SKIP_DIRS = {"lnInclude", "platforms", "Make", "build"}
+
+# Path fragments of finite-area options (fa::option), which use the same
+# registration macro name but a different run-time selection table
+FA_PATH_PARTS = ("faOptions",)
+
+# Headers that are always documented as base classes
+BASE_HEADERS = [
+    "src/finiteVolume/cfdTools/general/fvOptions/fvOption.H",
+    "src/fvOptions/cellSetOption/cellSetOption.H",
+    "src/fvOptions/interRegionOption/interRegionOption.H",
+]
+
+# Libraries that the standard solvers already link (no 'libs' entry needed)
+DEFAULT_LIBS = {"fvOptions", "finiteVolume", "meshTools", "OpenFOAM"}
+
+# Value types used by templated options (makeFvOption)
+TEMPLATE_TYPES = ["scalar", "vector", "sphericalTensor", "symmTensor", "tensor"]
+
+# Grouping by source location (first match wins)
+GROUP_RULES = [
+    ("src/fvOptions/sources/derived/", "sources"),
+    ("src/fvOptions/sources/general/", "general"),
+    ("src/fvOptions/sources/interRegion/", "interRegion"),
+    ("src/fvOptions/constraints/", "constraints"),
+    ("src/fvOptions/corrections/", "corrections"),
+    ("src/atmosphericModels/", "atmospheric"),
+    ("src/waveModels/", "wave"),
+    ("src/thermophysicalModels/radiation/", "radiation"),
+    ("src/optimisation/", "adjoint"),
+    ("applications/", "solverSpecific"),
+    ("modules/", "modules"),
+]
+
+# Extra search keywords (common terms not always present in the headers)
+ALIASES = {
+    "SemiImplicitSource": "heat source generation volumetric mass momentum "
+                          "injection su sp explicit implicit 熱源 発熱 生成 湧き出し "
+                          "質量 運動量 ソース項 体積",
+    "CodedSource": "user code custom expression 自作 コード 任意",
+    "FixedValueConstraint": "fix value constrain hold 固定 拘束",
+    "MapFieldConstraint": "map field interpolate 写像 マッピング",
+    "PhaseLimitStabilization": "stabilization multiphase 安定化",
+    "explicitPorositySource": "porous porosity darcy forchheimer filter resistance "
+                              "多孔質 ポーラス 圧損 抵抗 フィルタ",
+    "interRegionExplicitPorositySource": "porous porosity region 多孔質 領域間",
+    "fanMomentumSource": "fan pressure jump 送風機 ファン",
+    "actuationDiskSource": "actuator disk wind turbine propeller rotor thrust "
+                           "アクチュエータディスク 風車 プロペラ 推力",
+    "radialActuationDiskSource": "actuator disk wind turbine propeller radial "
+                                 "アクチュエータディスク 風車",
+    "rotorDisk": "rotor blade helicopter propeller blade element "
+                 "ロータ 翼素 プロペラ ヘリコプター",
+    "meanVelocityForce": "pressure gradient channel periodic bulk velocity "
+                         "圧力勾配 チャネル 周期 平均流速 駆動力",
+    "patchMeanVelocityForce": "pressure gradient patch bulk velocity 圧力勾配 平均流速",
+    "directionalPressureGradientExplicitSource": "pressure drop gradient direction "
+                                                 "圧損 圧力勾配 方向",
+    "limitTemperature": "clip bound temperature limit min max 温度制限 クリップ 発散",
+    "limitVelocity": "clip bound velocity limit max 速度制限 クリップ 発散",
+    "limitTurbulenceViscosity": "nut limit clip turbulence viscosity 乱流粘性 制限",
+    "velocityDampingConstraint": "damping sponge limit velocity 減衰 速度制限 発散",
+    "acousticDampingSource": "acoustic damping sponge absorbing 音響 減衰 吸収層",
+    "fixedTemperatureConstraint": "fix temperature constant 温度固定",
+    "buoyancyForce": "gravity buoyancy rho g 浮力 重力",
+    "buoyancyEnergy": "gravity buoyancy energy 浮力 重力 エネルギー",
+    "buoyancyTurbSource": "buoyancy turbulence k epsilon 浮力 乱流",
+    "solidificationMeltingSource": "melting solidification phase change latent heat "
+                                   "凝固 融解 相変化 潜熱",
+    "VoFSolidificationMeltingSource": "melting solidification VoF 凝固 融解",
+    "jouleHeatingSource": "joule electric current heating 電気 ジュール熱 通電",
+    "heatExchangerSource": "heat exchanger radiator effectiveness 熱交換器",
+    "constantHeatTransfer": "inter region heat transfer cht 領域間 熱伝達",
+    "tabulatedHeatTransfer": "inter region heat transfer table 領域間 熱伝達",
+    "tabulatedNTUHeatTransfer": "inter region heat transfer NTU 領域間 熱伝達",
+    "variableHeatTransfer": "inter region heat transfer 領域間 熱伝達",
+    "radiation": "radiation P1 fvDOM 輻射 放射",
+    "viscousDissipation": "viscous heating dissipation 粘性発熱 粘性散逸",
+    "tabulatedAccelerationSource": "acceleration sloshing motion 加速度 スロッシング",
+    "patchCellsSource": "patch cells boundary source 境界セル",
+    "multiphaseStabilizedTurbulence": "multiphase interface turbulence 混相 界面 乱流",
+    "atmCoriolisUSource": "coriolis earth rotation 地球自転 コリオリ",
+    "atmPlantCanopyUSource": "forest canopy tree drag 森林 樹木 キャノピー",
+    "atmPlantCanopyTSource": "forest canopy tree heat 森林 樹木 キャノピー",
+    "atmPlantCanopyTurbSource": "forest canopy tree turbulence 森林 樹木 キャノピー",
+    "atmBuoyancyTurbSource": "atmospheric buoyancy stability 大気 浮力 安定度",
+    "atmAmbientTurbSource": "atmospheric ambient turbulence 大気 乱流",
+    "atmLengthScaleTurbSource": "atmospheric mixing length 大気 混合長",
+    "atmNutSource": "atmospheric nut 大気 乱流粘性",
+    "multiphaseMangrovesSource": "mangrove vegetation drag wave マングローブ 植生 波",
+    "multiphaseMangrovesTurbulenceModel": "mangrove vegetation turbulence マングローブ 植生",
+    "topOSource": "topology optimisation porosity トポロジー最適化",
+}
+
+# Hand-written minimal templates for options whose header example is not a
+# usable minimal entry. Based on the header documentation and the tutorials
+# (e.g. tutorials/heatTransfer/chtMultiRegionSimpleFoam/cpuCabinet,
+# tutorials/compressible/rhoPimpleFoam/RAS/angledDuct). {TYPE}/{NAME} are
+# replaced by the selected type and entry name.
+CURATED = {
+    "SemiImplicitSource": """{NAME}
+{
+    type            {TYPE};
+
+    selectionMode   cellZone;        // all | cellZone | cellSet | points | geometric
+    cellZone        <cellZoneName>;
+
+    volumeMode      absolute;        // absolute: <quantity>, specific: <quantity>/m3
+
+    // Source S(x) = Su + Sp*x for each field x: (explicit Su, implicit Sp)
+    // Su has the type of the field, Sp is a scalar; both may be Function1
+    sources
+    {
+        <fieldName>     (<Su> 0);
+    }
+}""",
+    "explicitPorositySource": """{NAME}
+{
+    type            {TYPE};
+
+    explicitPorositySourceCoeffs
+    {
+        selectionMode   cellZone;    // the porous region must be a cellZone
+        cellZone        <cellZoneName>;
+
+        type            DarcyForchheimer;   // porosity model: DarcyForchheimer | fixedCoeff | powerLaw | ...
+
+        // Darcy (viscous) and Forchheimer (inertial) coefficients in the
+        // local coordinate system; negative values are multiplied by the
+        // largest positive coefficient
+        d               (<dx> <dy> <dz>);
+        f               (<fx> <fy> <fz>);
+
+        coordinateSystem
+        {
+            origin      (0 0 0);
+            e1          (1 0 0);
+            e3          (0 0 1);
+        }
+    }
+}""",
+}
+
+SECTION_RE = re.compile(r"^([A-Z][A-Za-z ]{1,30})\s*$")
+TYPENAME_RE = re.compile(r'\bTypeName(?:NoDebug)?\s*\(\s*"([^"]+)"\s*\)')
+REGISTER_RE = re.compile(
+    r"addToRunTimeSelectionTable\s*\(\s*(?:fv::)?option\s*,\s*([\w:]+)\s*,\s*dictionary\s*\)",
+    re.S)
+MAKEFV_RE = re.compile(r"^\s*makeFvOption\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)", re.M)
+TYPE_ENTRY_RE = re.compile(r"^\s*type\s+([\w:.<>]+)\s*;", re.M)
+LIBS_RE = re.compile(r"^\s*libs\s*\(([^)]*)\)\s*;", re.M)
+LINK_RE = re.compile(r"\\link\s+([\w.]+)\s+\\endlink")
+BASECLASS_RE = re.compile(
+    r"public\s+(?:Foam::)?(?:fv::)?(cellSetOption|interRegionOption|"
+    r"interRegionHeatTransferModel|option)\b")
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def is_foam_root(path):
+    return path is not None and Path(path, "src", "OpenFOAM").is_dir()
+
+
+def project_dir(arg=None, required=True):
+    """Return the OpenFOAM source root directory (or None if not found).
+
+    Search order: explicit argument, $WM_PROJECT_DIR, two levels above this
+    script (when installed inside an OpenFOAM tree, e.g. <root>/myTools/foamFV).
+    """
+    if arg:
+        cands = [Path(arg)]
+    else:
+        cands = []
+        env = os.environ.get("WM_PROJECT_DIR")
+        if env:
+            cands.append(Path(env))
+        cands.append(TOOL_DIR.parent.parent)
+    for c_ in cands:
+        if is_foam_root(c_):
+            return c_.resolve()
+    if required:
+        sys.exit("Error: OpenFOAM source tree not found. Source the OpenFOAM "
+                 "environment (etc/bashrc) or use --src <OpenFOAM root>.")
+    return None
+
+
+def user_db_path(version):
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "foamFV" / f"fvDatabase-{version}.json"
+
+
+def current_version():
+    env = os.environ.get("WM_PROJECT_DIR")
+    return Path(env).name if env else None
+
+
+def read_text(path):
+    try:
+        path = Path(path)
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def strip_comments(text):
+    """Remove C/C++ comments (string literals are not expected here)."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def header_comment(text):
+    """Return the leading documentation comment block of a source file."""
+    m = re.search(r"\\\*-{5,}[-*]*\*/", text)
+    if not m:
+        return ""
+    block = text[: m.start()]
+    # Drop the OpenFOAM banner / licence part
+    idx = block.find("\nClass")
+    if idx < 0:
+        idx = block.find("\nDescription")
+    return block[idx + 1:] if idx >= 0 else block
+
+
+def split_sections(comment):
+    """Split a doxygen header comment into {SectionName: text}.
+
+    Repeated sections (e.g. several 'Note' blocks) are concatenated.
+    """
+    sections = {}
+    current = None
+    buf = []
+
+    def flush():
+        if current:
+            old = sections.get(current)
+            txt = "\n".join(buf)
+            sections[current] = old + "\n\n" + txt if old else txt
+    for line in comment.splitlines():
+        m = SECTION_RE.match(line)
+        if m and not line.startswith(" "):
+            flush()
+            current = m.group(1).strip()
+            buf = []
+        elif current:
+            buf.append(line)
+    flush()
+    return sections
+
+
+def dedent(text):
+    lines = text.splitlines()
+    ind = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    cut = min(ind) if ind else 0
+    return "\n".join(l[cut:] for l in lines).strip("\n")
+
+
+def extract_verbatims(text):
+    """Return \\verbatim blocks; tolerate a missing \\endverbatim."""
+    out = []
+    parts = re.split(r"\\verbatim[ \t]*\n", text)
+    for part in parts[1:]:
+        end = part.find("\\endverbatim")
+        if end >= 0:
+            out.append(dedent(part[:end]))
+            continue
+        # Unterminated block: stop at the brace closing the first dictionary
+        lines = part.splitlines()
+        first = next((l for l in lines if l.strip()), "")
+        ind = len(first) - len(first.lstrip())
+        blk = []
+        for l in lines:
+            blk.append(l)
+            if l.strip() == "}" and len(l) - len(l.lstrip()) == ind:
+                break
+        out.append(dedent("\n".join(blk)))
+    return out
+
+
+def clean_doxygen(text):
+    """Remove doxygen markup from prose."""
+    text = re.sub(r"\\verbatim.*?\\endverbatim", "", text, flags=re.S)
+    text = re.sub(r"\\table.*?\\endtable", "", text, flags=re.S)
+    text = re.sub(r"<!--\s*\n\s*-->", " ", text)
+    text = LINK_RE.sub(r"\1", text)
+    text = re.sub(r"\\(c|a|b|em|p)\s+", "", text)
+    text = re.sub(r"\\vartheta", "theta", text)
+    text = re.sub(r"\\(end)?vartable", "", text)
+    text = re.sub(r"\\heading\s+", "", text)
+    text = re.sub(r"\\f\[.*?\\f\]", "[formula]", text, flags=re.S)
+    text = re.sub(r"\\f\$(.*?)\\f\$", r"\1", text, flags=re.S)
+    text = text.replace("\\<", "<").replace("\\>", ">")
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return dedent(text)
+
+
+def parse_tables(text):
+    """Parse every \\table ... \\endtable block into a list of row dicts."""
+    tables = []
+    for m in re.finditer(r"(?:\\heading\s+([^\n]*)\n\s*)?\\table\s*\n(.*?)\\endtable",
+                         text, re.S):
+        heading = (m.group(1) or "").strip()
+        body = re.sub(r"<!--\s*\n\s*-->", " ", m.group(2))
+        body = body.replace("\\<", "<").replace("\\>", ">")
+        lines = [l.strip() for l in body.splitlines() if "|" in l]
+        if not lines:
+            continue
+        head = [c.strip().lower() for c in lines[0].split("|")]
+        cols = {}
+        for i, h in enumerate(head):
+            if h.startswith("prop") or h in ("entry", "keyword", "name"):
+                cols.setdefault("name", i)
+            elif h.startswith("desc"):
+                cols.setdefault("desc", i)
+            elif h.startswith("type"):
+                cols.setdefault("type", i)
+            elif h.startswith("req") or h.startswith("mand"):
+                cols.setdefault("reqd", i)
+            elif h.startswith("def") or h.startswith("dflt"):
+                cols.setdefault("default", i)
+        if "name" not in cols:
+            continue
+        rows = []
+        for l in lines[1:]:
+            cells = [c.strip() for c in l.split("|")]
+
+            def cell(key):
+                i = cols.get(key)
+                return cells[i] if i is not None and i < len(cells) else ""
+            name = cell("name")
+            if not name:
+                continue
+            reqd = cell("reqd").lower()
+            if reqd.startswith(("yes", "y")):
+                reqd = "yes"
+            elif reqd.startswith("no"):
+                reqd = "no"
+            elif reqd.startswith(("cnd", "cond")):
+                reqd = "cond"
+            rows.append({
+                "name": name,
+                "desc": re.sub(r"\s+", " ", LINK_RE.sub(r"\1", cell("desc"))),
+                "type": cell("type"),
+                "reqd": reqd,
+                "default": cell("default").strip("-").strip() if cell("default") != "-" else "",
+            })
+        if rows:
+            tables.append({"heading": heading, "rows": rows})
+    return tables
+
+
+def lib_from_make(path):
+    """Find the library a source belongs to via the nearest Make/files.
+
+    Returns the library name, "" for solver-local sources (EXE) or None.
+    """
+    d = Path(path).parent
+    for _ in range(10):
+        mf = d / "Make" / "files"
+        if mf.is_file():
+            txt = read_text(mf)
+            m = re.search(r"^\s*LIB\s*=\s*\$\(FOAM_\w+\)/lib(\w+)", txt, re.M)
+            if m:
+                return m.group(1)
+            if re.search(r"^\s*EXE\s*=", txt, re.M):
+                return ""
+        if d.parent == d:
+            break
+        d = d.parent
+    return None
+
+
+def find_brace_block(lines, idx):
+    """Return (start, end) line indices of the dictionary enclosing lines[idx]."""
+    depth = 0
+    start = None
+    for i in range(idx, -1, -1):
+        s = re.sub(r"//.*", "", lines[i])
+        depth += s.count("}") - s.count("{")
+        if depth < 0:
+            start = i
+            break
+    if start is None:
+        return None
+    # Include the dictionary name when the brace is on its own line
+    if lines[start].strip() == "{" and start > 0 and lines[start - 1].strip():
+        start -= 1
+    depth = 0
+    for j in range(start, len(lines)):
+        s = re.sub(r"//.*", "", lines[j])
+        depth += s.count("{") - s.count("}")
+        if depth == 0 and "{" in "".join(lines[start:j + 1]):
+            return start, j
+    return None
+
+
+def top_level_types(text):
+    """Yield (line_index, type) of 'type X;' entries at dictionary depth 1.
+
+    In an fvOptions file every option is a top-level dictionary, so the
+    option type is at depth 1, while model types inside the coefficients
+    (e.g. 'type DarcyForchheimer;') are deeper.
+    """
+    depth = 0
+    in_block = False
+    for i, raw in enumerate(text.splitlines()):
+        line = raw
+        if in_block:
+            end = line.find("*/")
+            if end < 0:
+                continue
+            line = line[end + 2:]
+            in_block = False
+        line = re.sub(r"/\*.*?\*/", "", line)
+        if "/*" in line:
+            line = line[: line.find("/*")]
+            in_block = True
+        line = re.sub(r"//.*", "", line)
+        if depth == 1:
+            m = TYPE_ENTRY_RE.match(line)
+            if m:
+                yield i, m.group(1)
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            depth = 0
+
+
+# ---------------------------------------------------------------------------
+# Database build
+# ---------------------------------------------------------------------------
+
+def parse_header(hpath):
+    text = read_text(hpath)
+    comment = header_comment(text)
+    secs = split_sections(comment)
+    usage = secs.get("Usage", "")
+    desc_raw = secs.get("Description", "")
+    verbs = extract_verbatims(usage) + extract_verbatims(desc_raw)
+    tables = parse_tables(usage) + parse_tables(desc_raw)
+    verbs = [v.replace("\\<", "<").replace("\\>", ">") for v in verbs]
+    # Fallback: documentation in the .C/.cxx file
+    if not verbs or not tables:
+        for ext in (".C", ".cxx"):
+            src = Path(hpath).with_suffix(ext)
+            if src.is_file():
+                s2 = split_sections(header_comment(read_text(src)))
+                for key in ("Usage", "Description"):
+                    if not verbs:
+                        verbs = [v.replace("\\<", "<").replace("\\>", ">")
+                                 for v in extract_verbatims(s2.get(key, ""))]
+                    if not tables:
+                        tables = parse_tables(s2.get(key, ""))
+    inherited = [i for i in dict.fromkeys(LINK_RE.findall(usage + desc_raw))
+                 if i.endswith(".H") and i != Path(hpath).name]
+    return {
+        "text": text,
+        "description": clean_doxygen(desc_raw),
+        "verbatims": verbs,
+        "tables": tables,
+        "inherited": inherited,
+        "seeAlso": clean_doxygen(secs.get("See also", "")),
+        "note": clean_doxygen(secs.get("Note", "")),
+    }
+
+
+def pick_example(verbs, tnames):
+    """Choose the verbatim block that is a usage example of one of 'tnames'."""
+    for t in tnames:
+        pat = re.compile(r"^\s*type\s+(?:\\?<Type\\?>)?" + re.escape(t) + r"\s*;", re.M)
+        for v in verbs:
+            if pat.search(v):
+                return v
+    for v in verbs:
+        if TYPE_ENTRY_RE.search(v) and "{" in v:
+            return v
+    for v in verbs:
+        if "{" in v:
+            return v
+    return ""
+
+
+def guess_group(rel):
+    for prefix, g in GROUP_RULES:
+        if rel.startswith(prefix):
+            return g
+    return "other"
+
+
+def find_class_header(directory, cls):
+    """Return the header in 'directory' declaring 'class cls'."""
+    pat = re.compile(r"^\s*class\s+" + re.escape(cls) + r"\b\s*(?::|$|\n)", re.M)
+    same = directory / (cls + ".H")
+    if same.is_file():
+        return same
+    for h in sorted(directory.glob("*.H")):
+        if pat.search(read_text(h)):
+            return h
+    return None
+
+
+def scan_registrations(root):
+    """Return {header: {"cls", "names", "template"}} of registered fv::options."""
+    found = {}
+    for d in ("src", "applications", "modules"):
+        if not (root / d).is_dir():
+            continue
+        for f in (root / d).rglob("*"):
+            if f.suffix not in (".C", ".cxx") or not f.is_file():
+                continue
+            rel_parts = f.relative_to(root).parts
+            if SKIP_DIRS.intersection(rel_parts):
+                continue
+            if any(p in rel_parts for p in FA_PATH_PARTS):
+                continue
+            if rel_parts[:2] == ("applications", "test"):
+                continue
+            text = read_text(f)
+            if "option" not in text:
+                continue
+            for m in REGISTER_RE.finditer(strip_comments(text)):
+                cls = m.group(1).split("::")[-1]
+                h = find_class_header(f.parent, cls)
+                if h is None:
+                    continue
+                names = TYPENAME_RE.findall(read_text(h))
+                found[h] = {"cls": cls, "names": [names[0] if names else cls],
+                            "template": False}
+            for m in MAKEFV_RE.finditer(strip_comments(text)):
+                cls, typ = m.group(1), m.group(2)
+                h = find_class_header(f.parent, cls)
+                if h is None:
+                    continue
+                e = found.setdefault(h, {"cls": cls, "names": [], "template": True})
+                name = typ + cls
+                if name not in e["names"]:
+                    e["names"].append(name)
+    for e in found.values():
+        if e["template"]:
+            e["names"].sort(key=lambda n: next(
+                (i for i, t in enumerate(TEMPLATE_TYPES) if n.startswith(t)), 99))
+    return found
+
+
+def scan_tutorials(root, name_to_key):
+    """Map entry key -> list of tutorial fvOptions files using it."""
+    out = {}
+    tut = root / "tutorials"
+    if not tut.is_dir():
+        return out
+    for f in sorted(tut.rglob("fvOptions*")):
+        if not f.is_file():
+            continue
+        if f.stat().st_size > 400000:
+            continue
+        rel = str(f.relative_to(root))
+        for _, t in top_level_types(read_text(f)):
+            key = name_to_key.get(t)
+            if key:
+                lst = out.setdefault(key, [])
+                if rel not in lst:
+                    lst.append(rel)
+    return out
+
+
+def build_header_index(root):
+    """Map header basename -> relative path (first occurrence under src)."""
+    idx = {}
+    for f in (root / "src").rglob("*.H"):
+        if SKIP_DIRS.intersection(f.relative_to(root).parts):
+            continue
+        idx.setdefault(f.name, str(f.relative_to(root)))
+    return idx
+
+
+def cmd_build(args):
+    root = project_dir(args.src)
+    print(f"Scanning {root} ...")
+
+    regs = scan_registrations(root)
+    entries = {}
+    for h, r in sorted(regs.items()):
+        rel = str(h.relative_to(root))
+        info = parse_header(h)
+        key = r["cls"] if r["template"] else r["names"][0]
+        tnames = [r["cls"]] if r["template"] else r["names"]
+        example = pick_example(info["verbatims"], tnames)
+        lib = lib_from_make(h)
+        libs = []
+        lm = LIBS_RE.search(example)
+        if lm:
+            libs = [x.strip().strip('"') for x in lm.group(1).split()]
+        elif lib and lib not in DEFAULT_LIBS:
+            libs = [lib]
+        # Base classes: documented links plus the actual C++ inheritance
+        inherited = list(info["inherited"])
+        for b in BASECLASS_RE.findall(info["text"]):
+            hb = {"option": "fvOption.H"}.get(b, b + ".H")
+            if hb not in inherited:
+                inherited.append(hb)
+        desc = info["description"]
+        summary = desc.split("\n\n")[0].replace("\n", " ").strip()
+        e = {
+            "name": key,
+            "display": ("<Type>" + r["cls"]) if r["template"] else key,
+            "class": r["cls"],
+            "template": r["template"],
+            "variants": r["names"] if r["template"] else [],
+            "group": guess_group(rel),
+            "header": rel,
+            "library": lib if lib is not None else "",
+            "libs": libs,
+            "summary": summary,
+            "description": desc,
+            "example": example,
+            "otherExamples": [v for v in info["verbatims"] if v != example][:4],
+            "tables": info["tables"],
+            "inherited": inherited,
+            "cellSet": "cellSetOption.H" in inherited,
+            "interRegion": "interRegionOption.H" in inherited
+                           or "interRegionHeatTransferModel.H" in inherited,
+            "note": info["note"],
+            "seeAlso": info["seeAlso"],
+            "aliases": ALIASES.get(key, ""),
+        }
+        entries[key] = e
+
+    name_to_key = {}
+    for k, e in entries.items():
+        name_to_key[k] = k
+        for v in e["variants"]:
+            name_to_key[v] = k
+    tutorials = scan_tutorials(root, name_to_key)
+    for k, e in entries.items():
+        e["tutorials"] = tutorials.get(k, [])
+
+    # Base headers documenting inherited entries
+    hidx = build_header_index(root)
+    wanted = list(dict.fromkeys(
+        [Path(b).name for b in BASE_HEADERS] +
+        [i for e in entries.values() for i in e["inherited"]]))
+    bases = {}
+    while wanted:
+        name = wanted.pop(0)
+        if name in bases:
+            continue
+        rel = next((b for b in BASE_HEADERS if Path(b).name == name), None) or hidx.get(name)
+        if not rel or not (root / rel).is_file():
+            continue
+        info = parse_header(root / rel)
+        parents = []
+        for b in BASECLASS_RE.findall(info["text"]):
+            hb = {"option": "fvOption.H"}.get(b, b + ".H")
+            if hb != name and hb not in parents:
+                parents.append(hb)
+                wanted.append(hb)
+        bases[name] = {
+            "header": rel,
+            "inherited": parents,
+            "summary": info["description"].split("\n\n")[0].replace("\n", " "),
+            "example": pick_example(info["verbatims"], []),
+            "tables": info["tables"],
+        }
+
+    # Propagate base-class chains (e.g. interRegionHeatTransferModel ->
+    # interRegionOption) to the entries
+    for e in entries.values():
+        todo = list(e["inherited"])
+        while todo:
+            b = todo.pop(0)
+            for pb in bases.get(b, {}).get("inherited", []):
+                if pb not in e["inherited"]:
+                    e["inherited"].append(pb)
+                    todo.append(pb)
+        e["cellSet"] = "cellSetOption.H" in e["inherited"]
+        e["interRegion"] = "interRegionOption.H" in e["inherited"]
+
+    db = {
+        "tool": "foamFV",
+        "version": root.name,
+        "built": date.today().isoformat(),
+        "fvOptions": dict(sorted(entries.items(), key=lambda kv: kv[0].lower())),
+        "bases": bases,
+    }
+    out = Path(args.output) if args.output else user_db_path(root.name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(db, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    es = list(entries.values())
+    noex = sorted(e["name"] for e in es if not e["example"])
+    notab = sorted(e["name"] for e in es if not e["tables"])
+    print(f"Wrote {out}")
+    if not args.output and current_version() != root.name:
+        print(f"  note: used automatically when $WM_PROJECT_DIR ends with '{root.name}';"
+              f" otherwise set FOAMFV_DB={out}")
+    print(f"  fvOptions (classes): {len(es)}")
+    print(f"  selectable types   : {sum(len(e['variants']) or 1 for e in es)}")
+    print(f"  with example       : {len(es) - len(noex)}")
+    print(f"  with param table   : {len(es) - len(notab)}")
+    print(f"  used in tutorials  : {sum(1 for e in es if e['tutorials'])}")
+    print(f"  base classes       : {len(bases)}")
+    if args.verbose:
+        print("  no example    :", " ".join(noex) or "-")
+        print("  no param table:", " ".join(notab) or "-")
+
+
+# ---------------------------------------------------------------------------
+# Query commands
+# ---------------------------------------------------------------------------
+
+def find_db():
+    """Return the database path according to the lookup order."""
+    env = os.environ.get("FOAMFV_DB")
+    if env:
+        if not Path(env).is_file():
+            sys.exit(f"Error: FOAMFV_DB={env} not found.")
+        return Path(env)
+    ver = current_version()
+    if ver and user_db_path(ver).is_file():
+        return user_db_path(ver)
+    return BUNDLED_DB
+
+
+def load_db():
+    path = find_db()
+    if not path.is_file():
+        sys.exit("Error: database not found. Run 'foamFV build' first.")
+    db = json.loads(path.read_text(encoding="utf-8"))
+    ver = current_version()
+    if ver and path == BUNDLED_DB and db.get("version") != ver and not os.environ.get("FOAMFV_QUIET"):
+        print(f"Warning: bundled database is for {db.get('version')}, but the "
+              f"environment is {ver}. Run 'foamFV build' for an exact match.",
+              file=sys.stderr)
+    return db
+
+
+def use_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if use_color() else text
+
+
+def lookup(db, name):
+    """Return (entry, selected type name). Accepts class or variant names."""
+    fvs = db["fvOptions"]
+    if name in fvs:
+        e = fvs[name]
+        return e, (e["variants"][0] if e["template"] else e["name"])
+    low = name.lower()
+    for k, e in fvs.items():
+        if k.lower() == low:
+            return e, (e["variants"][0] if e["template"] else e["name"])
+        for v in e["variants"]:
+            if v.lower() == low:
+                return e, v
+        if e["display"].lower() == low:
+            return e, e["variants"][0]
+    close = [e["display"] for k, e in fvs.items()
+             if low in k.lower() or any(low in v.lower() for v in e["variants"])]
+    msg = f"Error: unknown fvOption '{name}'."
+    if close:
+        msg += " Did you mean: " + ", ".join(close[:10]) + " ?"
+    sys.exit(msg)
+
+
+def print_rows(entries):
+    w = max([len(e["display"]) for e in entries] + [4])
+    for e in entries:
+        flag = "T" if e["tutorials"] else " "
+        flag += "Z" if e["cellSet"] else ("R" if e["interRegion"] else " ")
+        s = e["summary"]
+        if len(s) > 78:
+            s = s[:75] + "..."
+        print(f"{c(e['display'].ljust(w), '1;36')}  {flag}  {e['group']:<14} {s}")
+
+
+def legend():
+    return ("T: used in tutorials, Z: cell selection (selectionMode), "
+            "R: inter-region option")
+
+
+def cmd_list(args):
+    db = load_db()
+    es = list(db["fvOptions"].values())
+    if args.group:
+        es = [e for e in es if args.group.lower() in e["group"].lower()]
+    if args.groups:
+        cnt = {}
+        for e in es:
+            cnt[e["group"]] = cnt.get(e["group"], 0) + 1
+        for g, n in sorted(cnt.items()):
+            print(f"{g:<16}{n}")
+        return
+    print_rows(es)
+    print(f"\n{len(es)} entries  ({legend()})")
+
+
+def cmd_search(args):
+    db = load_db()
+    words = [w.lower() for w in args.keywords]
+    hits = []
+    for e in db["fvOptions"].values():
+        names = " ".join([e["name"], e["display"]] + e["variants"]).lower()
+        hay = " ".join([names, e["description"], e["header"], e.get("aliases", ""),
+                        " ".join(r["name"] for t in e["tables"] for r in t["rows"])]).lower()
+        if all(w in hay for w in words):
+            score = sum(3 for w in words if w in names) + \
+                sum(1 for w in words if w in e["summary"].lower()) + \
+                sum(2 for w in words if w in e.get("aliases", "").lower()) + \
+                (1 if e["tutorials"] else 0)
+            hits.append((-score, e["name"].lower(), e))
+    if not hits:
+        print("No match. Try English keywords or 'foamFV list'.")
+        return
+    print_rows([h[2] for h in sorted(hits)])
+
+
+def format_tables(tables, only_required=False):
+    out = []
+    for t in tables:
+        rows = [r for r in t["rows"] if not only_required or r["reqd"] == "yes"]
+        if not rows:
+            continue
+        if t["heading"]:
+            out.append(c(f"  [{t['heading']}]", "1"))
+        wn = max(len(r["name"]) for r in rows)
+        wt = max([len(r["type"]) for r in rows] + [4])
+        out.append(f"  {'Property'.ljust(wn)}  {'Type'.ljust(wt)}  Reqd  Default        Description")
+        for r in rows:
+            name = r["name"].ljust(wn)
+            if r["reqd"] == "yes":
+                name = c(name, "1;31")
+            elif r["reqd"] == "cond":
+                name = c(name, "1;35")
+            out.append(f"  {name}  {r['type'].ljust(wt)}  {r['reqd'][:4]:<4}  "
+                       f"{(r['default'] or '-')[:13]:<13}  {r['desc']}")
+    return "\n".join(out)
+
+
+def cmd_show(args):
+    db = load_db()
+    e, _ = lookup(db, args.name)
+    print(c(f"=== {e['display']} ===", "1;36") + f"   ({e['group']})")
+    if e["template"]:
+        print(f"Types  : {', '.join(e['variants'])}")
+    print(f"Header : {e['header']}")
+    print(f"Library: lib{e['library']}" if e["library"] else
+          "Library: (built into the solver)")
+    if e["libs"]:
+        print(f"libs   : ({' '.join(e['libs'])})   <- add to the entry or controlDict "
+              f"unless the solver already links it")
+    print("File   : constant/fvOptions (system/fvOptions is read only if the former is absent)")
+    print()
+    print(c("Description", "1;33"))
+    print("\n".join("  " + l for l in (e["description"] or "-").splitlines()))
+    print()
+    print(c("Example (from header)", "1;33"))
+    print("\n".join("  " + l for l in (e["example"] or "(none)").splitlines()))
+    if args.more and e["otherExamples"]:
+        for v in e["otherExamples"]:
+            print()
+            print("\n".join("  " + l for l in v.splitlines()))
+    elif e["otherExamples"]:
+        print(f"  (+{len(e['otherExamples'])} more block(s) in the header: use --more)")
+    print()
+    if e["tables"]:
+        print(c("Parameters", "1;33") + "  (red = mandatory, magenta = conditional)")
+        print(format_tables(e["tables"]))
+        print()
+    if e["inherited"]:
+        print(c("Inherited entries documented in", "1;33") + ": " + ", ".join(e["inherited"]))
+        if args.inherited:
+            for h in e["inherited"]:
+                b = db["bases"].get(h)
+                if b and b["tables"]:
+                    print(c(f"  --- {h} ---", "1"))
+                    print(format_tables(b["tables"]))
+        else:
+            print("  (use --inherited to show them"
+                  + ("; selectionMode/cellZone come from cellSetOption.H" if e["cellSet"] else "")
+                  + ")")
+        print()
+    if e["note"]:
+        print(c("Note", "1;33"))
+        print("\n".join("  " + l for l in e["note"].splitlines()))
+        print()
+    if e["tutorials"]:
+        n = len(e["tutorials"])
+        print(c(f"Used in tutorials ({n})", "1;33") + f"  -> foamFV example {e['name']}")
+        for t in e["tutorials"][: args.max]:
+            print("  " + t)
+        if n > args.max:
+            print(f"  ... {n - args.max} more")
+
+
+def cmd_example(args):
+    db = load_db()
+    e, _ = lookup(db, args.name)
+    root = project_dir(args.src, required=False)
+    if not e["tutorials"]:
+        print(f"'{e['display']}' is not used in the tutorials. Header example:\n")
+        print(e["example"])
+        return
+    if root is None:
+        print("OpenFOAM tutorials not found (source the OpenFOAM environment or use "
+              "--src). Files using it:")
+        for rel in e["tutorials"][: args.max * 3]:
+            print("  " + rel)
+        return
+    names = set(e["variants"] or [e["name"]])
+    shown = 0
+    for rel in e["tutorials"]:
+        if not (root / rel).is_file():
+            continue
+        text = read_text(root / rel)
+        lines = text.splitlines()
+        for i, t in top_level_types(text):
+            if t not in names:
+                continue
+            blk = find_brace_block(lines, i)
+            if blk:
+                print(c(f"// ---- {rel}:{blk[0] + 1}", "1;32"))
+                print("\n".join(lines[blk[0]: blk[1] + 1]))
+            else:
+                print(c(f"// ---- {rel} (whole file)", "1;32"))
+                print(text)
+            print()
+            shown += 1
+            if shown >= args.max:
+                print(f"(showed {shown}; {len(e['tutorials'])} file(s) use it, "
+                      f"use -m to show more)")
+                return
+
+
+# ---------------------------------------------------------------------------
+# Entry generation
+# ---------------------------------------------------------------------------
+
+def build_entry(e, type_name, entry_name, mode, bases=None, fallback=None):
+    """Create a dictionary entry text from the header example."""
+    curated = CURATED.get(e["class"]) or CURATED.get(e["name"])
+    if curated:
+        text = curated.replace("{TYPE}", type_name).replace("{NAME}", entry_name)
+        return finish_entry(e, text, mode, bases)
+    ex = e["example"]
+    if (not ex or not TYPE_ENTRY_RE.search(ex)) and fallback:
+        lines = fallback.splitlines()
+        lines[0] = entry_name
+        text = "\n".join(lines)
+        text = re.sub(r"^(\s*type\s+)[\w:.]+", r"\g<1>" + type_name, text, count=1, flags=re.M)
+        return finish_entry(e, text, mode, bases)
+    if not ex or not TYPE_ENTRY_RE.search(ex):
+        ex = "{0}\n{{\n    type            {1};\n}}".format(entry_name, type_name)
+    # Resolve the templated type name
+    ex = re.sub(r"\\?<Type\\?>" + re.escape(e["class"]), type_name, ex)
+    lines = ex.splitlines()
+    # Rename the top-level dictionary
+    for i, l in enumerate(lines):
+        if l.strip() and not l.strip().startswith("//"):
+            if re.match(r"^[\w<>.\-]+\s*$", l.strip()):
+                lines[i] = entry_name
+            break
+    # Make sure the type entry carries the selected type
+    for i, l in enumerate(lines):
+        m = TYPE_ENTRY_RE.match(l)
+        if m:
+            lines[i] = l.replace(m.group(1), type_name, 1)
+            break
+    required = {r["name"] for t in e["tables"] for r in t["rows"] if r["reqd"] == "yes"}
+    # Locate the outer braces of the top-level dictionary
+    first = next((i for i, l in enumerate(lines) if l.strip() == "{"), None)
+    last = max((i for i, l in enumerate(lines) if l.strip() == "}"), default=None)
+    has_markers = any(l.strip().startswith("//") and "mandatory" in l.lower() for l in lines)
+    out = []
+    section = "mandatory"
+    depth = 0
+    for i, l in enumerate(lines):
+        s = l.strip()
+        low = s.lower()
+        if depth <= 1 and low.startswith("//"):
+            if "conditional" in low:
+                section = "conditional"
+            elif "optional" in low:
+                section = "optional"
+            elif "inherited" in low:
+                section = "inherited"
+            elif "mandatory" in low:
+                section = "mandatory"
+            elif re.match(r"//\s*(option\b|option-|or\b)", low):
+                section = "conditional"
+        nopen = s.count("{") - s.count("}") if not s.startswith("//") else 0
+        if s in ("...", "// ..."):
+            depth += nopen
+            continue
+        key = re.match(r"^([\w\-]+)\s", s + " ")
+        is_req = depth == 1 and bool(key) and key.group(1) in required and ";" in s
+        outer = first is None or i <= first or i == last
+        # Without section markers, treat nested dictionaries as optional
+        nested = False
+        if not has_markers and not outer:
+            nxt = next((x.strip() for x in lines[i + 1:] if x.strip()), "")
+            nested = depth >= 2 or nopen > 0 or \
+                (depth == 1 and re.match(r"^[\w<>\-]+$", s) is not None and nxt.startswith("{"))
+        if outer or (section == "mandatory" and not nested) or is_req:
+            out.append(l)
+        elif mode == "full":
+            if s and not s.startswith("//"):
+                out.append(re.sub(r"^(\s*)", r"\1// ", l, count=1))
+            else:
+                out.append(l)
+        depth += nopen
+    # Drop dangling comment headers / blank runs
+    clean = []
+    for l in out:
+        if not l.strip() and clean and not clean[-1].strip():
+            continue
+        clean.append(l)
+    if mode != "full":
+        clean = [l for j, l in enumerate(clean)
+                 if not (l.strip().startswith("//") and
+                         (j + 1 >= len(clean) or not clean[j + 1].strip()
+                          or clean[j + 1].strip() == "}"))]
+    out = [l for j, l in enumerate(clean)
+           if not (not l.strip() and j + 1 < len(clean) and clean[j + 1].strip() == "}")]
+    return finish_entry(e, "\n".join(out), mode, bases)
+
+
+def mandatory_lines(example):
+    """Return mandatory one-line entries at depth 1 of a base-class example."""
+    out = []
+    section = "mandatory"
+    depth = 0
+    for l in example.splitlines():
+        s = l.strip()
+        low = s.lower()
+        if depth == 1 and low.startswith("//"):
+            if "optional" in low or "conditional" in low:
+                section = "optional"
+            elif "inherited" in low or "derived" in low:
+                section = "other"
+            elif "mandatory" in low:
+                section = "mandatory"
+        elif depth == 1 and section == "mandatory" and re.match(r"^\w+\s+[^{]*;", s) \
+                and not s.startswith("type"):
+            out.append(s)
+        depth += s.count("{") - s.count("}") if not s.startswith("//") else 0
+    return out
+
+
+def finish_entry(e, text, mode, bases=None):
+    """Add base-class entries, libs and (full mode) the documented extras."""
+    live = strip_comments(text)
+    type_re0 = re.compile(r"(^\s*type\s+[\w:.]+\s*;[^\n]*\n)", re.M)
+    for b in e["inherited"]:
+        if b in ("fvOption.H", "cellSetOption.H") or not bases or b not in bases:
+            continue
+        add = [l for l in mandatory_lines(bases[b].get("example", ""))
+               if not re.search(r"^\s*" + re.escape(l.split()[0]) + r"\s", live, re.M)]
+        if add:
+            block = f"\n    // Mandatory entries from {b}\n" + \
+                "".join(f"    {l}\n" for l in add)
+            text = type_re0.sub(lambda m: m.group(1) + block, text, count=1)
+            live = strip_comments(text)
+    type_re = re.compile(r"(^\s*type\s+[\w:.]+\s*;[^\n]*\n)", re.M)
+    # Cell selection (cellSetOption) is mandatory but usually only "inherited"
+    if e["cellSet"] and not re.search(r"^\s*selectionMode\s", live, re.M):
+        text = type_re.sub(
+            r"\1\n    // Cell selection (cellSetOption.H)\n"
+            r"    selectionMode   cellZone;        // all | cellZone | cellSet | points | geometric\n"
+            r"    cellZone        <cellZoneName>;\n", text, count=1)
+    # Ensure the libs entry exists
+    if e["libs"] and not LIBS_RE.search(text):
+        text = type_re.sub(r"\1    libs            (" + " ".join(e["libs"]) + ");\n",
+                           text, count=1)
+    if mode == "full":
+        # Document parameters missing from the example
+        present = set(re.findall(r"^\s*(?://\s*)?(\w+)\s", text, re.M))
+        extra = [r for t in e["tables"] for r in t["rows"]
+                 if r["name"] not in present and re.match(r"^\w+$", r["name"])]
+        if extra:
+            add = ["", "    // Further entries documented in the header:"]
+            for r in extra:
+                d = f" (default: {r['default']})" if r["default"] else ""
+                add.append(f"    // {r['name']:<16} <{r['type'] or 'value'}>;  "
+                           f"// {r['desc']}{d}")
+            idx = text.rfind("}")
+            text = text[:idx].rstrip("\n") + "\n" + "\n".join(add) + "\n" + text[idx:]
+        common = "active, log"
+        if e["cellSet"]:
+            common += ", selectionMode, cellZone(s), cellSet, points, timeStart, duration"
+        text += f"\n\n// Common entries ({', '.join(e['inherited']) or 'fvOption.H'}): {common}"
+    return text
+
+
+def apply_case_values(text, zone=None, fields=None):
+    """Fill selection/field entries given on the command line."""
+    if zone:
+        if zone == "all":
+            text = re.sub(r"^(\s*selectionMode\s+)[^;]*;[^\n]*", r"\1all;", text, count=1, flags=re.M)
+            text = re.sub(r"^\s*cellZone\s+<[^>]*>;[^\n]*\n", "", text, flags=re.M)
+        else:
+            text = re.sub(r"^(\s*selectionMode\s+)[^;]*;[^\n]*", r"\1cellZone;", text,
+                          count=1, flags=re.M)
+            text = re.sub(r"^(\s*cellZone\s+)[^;]*;", r"\g<1>" + zone + ";", text,
+                          count=1, flags=re.M)
+    if fields:
+        fl = fields.replace(",", " ").split()
+        text = re.sub(r"^(\s*fields\s+)[^;]*;", r"\g<1>(" + " ".join(fl) + ");", text,
+                      count=1, flags=re.M)
+        text = re.sub(r"^(\s*field\s+)[^;]*;", r"\g<1>" + fl[0] + ";", text,
+                      count=1, flags=re.M)
+        if len(fl) == 1:
+            text = text.replace("<fieldName>", fl[0])
+    return text
+
+
+def case_info(case, region=None):
+    """Return (cellZones, fields) found in the case (best effort)."""
+    mesh = case / "constant" / (region or "") / "polyMesh"
+    zones = []
+    for fn in ("cellZones", "cellZones.gz"):
+        p = mesh / fn
+        if p.is_file():
+            txt = read_text(p)
+            # Header meta data written by recent versions: names N ( a b );
+            m = re.search(r"^\s*names\s+\d*\s*\(([^)]*)\)", txt[:4000], re.M)
+            if m:
+                zones = m.group(1).split()
+            else:
+                zones = re.findall(r"^\(?(\w+)\s*\n\s*\{\s*\n\s*type\s+cellZone\s*;",
+                                   txt, re.M)
+            break
+    fields = []
+    for t in ("0", "0.orig"):
+        d = case / t / (region or "")
+        if d.is_dir():
+            fields = sorted(p.name.replace(".gz", "") for p in d.iterdir()
+                            if p.is_file() and not p.name.startswith(".")
+                            and not p.name.endswith((".orig", ".bak")))
+            break
+    return zones, fields
+
+
+def foam_header(location):
+    return (
+        "/*--------------------------------*- C++ -*----------------------------------*\\\n"
+        "  =========                 |\n"
+        "  \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox\n"
+        "   \\\\    /   O peration     |\n"
+        "    \\\\  /    A nd           | www.openfoam.com\n"
+        "     \\\\/     M anipulation  |\n"
+        "\\*---------------------------------------------------------------------------*/\n"
+        "FoamFile\n{\n"
+        "    version     2.0;\n"
+        "    format      ascii;\n"
+        "    class       dictionary;\n"
+        f"    location    \"{location}\";\n"
+        "    object      fvOptions;\n"
+        "}\n"
+        "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n")
+
+
+FOAM_FOOTER = "\n// ************************************************************************* //\n"
+
+
+def insert_entry(target, location, entry_name, body):
+    """Append an entry to an fvOptions file (create it if needed)."""
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(foam_header(location) + body + "\n" + FOAM_FOOTER, encoding="utf-8")
+        print(f"Created {target}")
+        return True
+    text = read_text(target)
+    if re.search(r"^" + re.escape(entry_name) + r"\s*(\{|$)", strip_comments(text), re.M):
+        print(f"Error: entry '{entry_name}' already exists in {target} (use -n)",
+              file=sys.stderr)
+        return False
+    bak = target.with_name(target.name + ".bak")
+    if not bak.exists():  # keep the oldest (original) backup
+        shutil.copy2(target, bak)
+    lines = text.rstrip("\n").splitlines()
+    tail = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("// *****"):
+            tail = i
+            break
+    new = body.rstrip("\n").splitlines() + [""]
+    if tail is None:
+        lines += [""] + new
+    else:
+        # Remove the blank lines before the footer, then insert
+        while tail > 0 and not lines[tail - 1].strip():
+            del lines[tail - 1]
+            tail -= 1
+        lines[tail:tail] = [""] + new + [""]
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Appended '{entry_name}' to {target} (backup: {bak.name})")
+    return True
+
+
+def tutorial_block(e, type_name):
+    """Return (block text, path) of the first tutorial entry using the type."""
+    root = project_dir(None, required=False)
+    if root is None:
+        return None, None
+    names = [type_name] + [n for n in (e["variants"] or [e["name"]]) if n != type_name]
+    for want in names:
+        for rel in e["tutorials"]:
+            text = read_text(root / rel)
+            lines = text.splitlines()
+            for i, t in top_level_types(text):
+                if t == want:
+                    blk = find_brace_block(lines, i)
+                    if blk:
+                        return dedent("\n".join(lines[blk[0]: blk[1] + 1])), rel
+    return None, None
+
+
+def cmd_add(args):
+    db = load_db()
+    e, type_name = lookup(db, args.name)
+    if e["template"] and args.name not in e["variants"]:
+        print(f"Note: '{args.name}' is templated; using '{type_name}' "
+              f"(other types: {', '.join(e['variants'][1:])})", file=sys.stderr)
+    case = Path(args.case).resolve()
+    entry_name = args.entry or type_name + "1"
+    fallback = None
+    src_note = e["header"]
+    if (not e["example"] or not TYPE_ENTRY_RE.search(e["example"])) and e["tutorials"]:
+        fallback, rel = tutorial_block(e, type_name)
+        if fallback:
+            src_note = f"tutorial {rel} (no usable example in {e['header']}; adjust the values)"
+    text = build_entry(e, type_name, entry_name, "full" if args.full else "minimal",
+                       db.get("bases"), fallback)
+    text = apply_case_values(text, args.zone, args.fields)
+    stamp = date.today().isoformat()
+    body = f"// Generated by foamFV from {src_note} ({stamp})\n{text}\n"
+    placeholders = sorted(set(re.findall(r"<[\w ,:/|.\-]+>", strip_comments(text))))
+
+    location = "system" if args.system else "constant"
+    target = case / location / (args.region or "") / "fvOptions"
+    if args.stdout or not args.insert:
+        print(body)
+        if not args.stdout:
+            print(f"// (use --insert to append it to {target})", file=sys.stderr)
+    else:
+        if not (case / "constant").is_dir() and not (case / "system").is_dir():
+            sys.exit(f"Error: {case} does not look like a case directory (use -case)")
+        if not insert_entry(target, location + (f"/{args.region}" if args.region else ""),
+                            entry_name, body):
+            sys.exit(1)
+        # fv::options reads constant/fvOptions and falls back to
+        # system/fvOptions only when the former does not exist
+        other = case / ("constant" if args.system else "system") / (args.region or "") / "fvOptions"
+        if other.exists():
+            ignored = target if args.system else other
+            print(c(f"Warning: both constant/ and system/ fvOptions exist; only "
+                    f"constant/fvOptions is read, {ignored} is ignored.", "1;31"),
+                  file=sys.stderr)
+
+    # Hints from the case
+    if (case / "constant").is_dir():
+        zones, fields = case_info(case, args.region)
+        if e["cellSet"] and not args.zone:
+            print("cellZones in mesh: " + (" ".join(zones) if zones else
+                  "(none found: create them with topoSet/setsToZones, or use --zone all)"),
+                  file=sys.stderr)
+        elif args.zone and args.zone != "all" and zones and args.zone not in zones:
+            print(c(f"Warning: cellZone '{args.zone}' not found in the mesh "
+                    f"({' '.join(zones)})", "1;31"), file=sys.stderr)
+        if fields and re.search(r"^\s*fields?\s", strip_comments(text), re.M) and not args.fields:
+            print("fields in 0/: " + " ".join(fields), file=sys.stderr)
+    if placeholders:
+        print(c("Edit these placeholders before running: ", "1;31") + " ".join(placeholders),
+              file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# HTML catalog
+# ---------------------------------------------------------------------------
+
+def cmd_html(args):
+    db = load_db()
+    if not HTML_TEMPLATE.is_file():
+        sys.exit(f"Error: template {HTML_TEMPLATE} not found")
+    # Pre-generate the ready-to-edit entries shown in the catalog
+    for e in db["fvOptions"].values():
+        tname = e["variants"][0] if e["template"] else e["name"]
+        fallback = None
+        if (not e["example"] or not TYPE_ENTRY_RE.search(e["example"])) and e["tutorials"]:
+            fallback, _ = tutorial_block(e, tname)
+        e["entry"] = build_entry(e, tname, tname + "1", "minimal", db.get("bases"), fallback)
+    data = json.dumps(db, ensure_ascii=False).replace("</", "<\\/")
+    page = read_text(HTML_TEMPLATE).replace("/*__FV_DATA__*/null", data)
+    out = Path(args.output) if args.output else HTML_FILE
+    out.write_text(page, encoding="utf-8")
+    print(f"Wrote {out}")
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="foamFV", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("build", help="scan OpenFOAM sources and build the database")
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.add_argument("-o", "--output",
+                   help="database file (default: ~/.local/share/foamFV/fvDatabase-<version>.json)")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("list", help="list fvOptions")
+    s.add_argument("-g", "--group",
+                   help="filter by group (sources, general, constraints, corrections, ...)")
+    s.add_argument("--groups", action="store_true", help="list groups with counts")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("search", help="search names/descriptions (all keywords must match)")
+    s.add_argument("keywords", nargs="+")
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("show", help="show documentation of an fvOption")
+    s.add_argument("name")
+    s.add_argument("-i", "--inherited", action="store_true", help="also show inherited entries")
+    s.add_argument("--more", action="store_true", help="show additional header examples")
+    s.add_argument("-m", "--max", type=int, default=8, help="max tutorial paths to list")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("example", help="print usage blocks taken from the tutorials")
+    s.add_argument("name")
+    s.add_argument("-m", "--max", type=int, default=3)
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.set_defaults(func=cmd_example)
+
+    s = sub.add_parser("add", help="generate an entry (print, or append to fvOptions with --insert)")
+    s.add_argument("name", help="type name, e.g. scalarSemiImplicitSource or limitTemperature")
+    s.add_argument("-case", "--case", default=".", help="case directory (default: cwd)")
+    s.add_argument("-n", "--entry", help="entry name (default: <type>1)")
+    s.add_argument("-z", "--zone", help="cellZone name to select ('all' for selectionMode all)")
+    s.add_argument("--fields", help="field name(s) for 'fields'/'field', e.g. 'T' or 'U,k'")
+    s.add_argument("-region", "--region", help="region name (multi-region cases)")
+    s.add_argument("--system", action="store_true",
+                   help="use system/fvOptions instead of constant/fvOptions")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--minimal", action="store_true", help="mandatory entries only (default)")
+    g.add_argument("--full", action="store_true", help="also list optional entries as comments")
+    s.add_argument("--insert", action="store_true",
+                   help="append to <case>/constant/fvOptions (created if missing, backup .bak)")
+    s.add_argument("--stdout", action="store_true", help="only print (default without --insert)")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("html", help="generate catalog.html")
+    s.add_argument("-o", "--output")
+    s.set_defaults(func=cmd_html)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
